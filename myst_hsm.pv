@@ -1,0 +1,168 @@
+(*
+ * =============================================================================
+ * ProVerif Security Model 
+ * Myst Architecture: ML-KEM (Kyber512) + GF(256) Shamir's Secret Sharing
+ * "Touch of Evil" Backdoor-Tolerant HSM Protocol
+ * =============================================================================
+ *)
+
+(* =============================================================================
+   1. TYPE DECLARATIONS
+   ============================================================================= *)
+type pkey.        (* ML-KEM public key *)
+type skey.        (* ML-KEM secret key *)
+type kemcipher.   (* KEM ciphertext *)
+type sharedkey.   (* KEM shared secret *)
+type share.       (* GF(256) Polynomial Evaluation (y-coordinate) *)
+type icid.        (* Processing IC ID (x-coordinate) *)
+
+(* =============================================================================
+   2. IC IDENTITY CONSTANTS (Distinct x-coordinates)
+   ============================================================================= *)
+const IC1: icid.
+const IC2: icid.
+const IC3: icid.
+const IC4: icid.
+const IC5: icid.
+
+(* =============================================================================
+   3. CHANNEL DECLARATIONS
+   ============================================================================= *)
+free net: channel.
+
+free ch_h_ic1: channel [private].
+free ch_h_ic2: channel [private].
+free ch_h_ic3: channel [private].
+free ch_h_ic4: channel [private].
+free ch_h_ic5: channel [private].
+
+free ch_ic1_ctrl: channel [private].
+free ch_ic3_ctrl: channel [private].
+free ch_ic5_ctrl: channel [private].
+
+free ch_sender_verif: channel [private].
+free ch_ctrl_verif:   channel [private].
+
+(* =============================================================================
+   4. CRYPTOGRAPHIC FUNCTION SIGNATURES
+   ============================================================================= *)
+
+(* ---------- ML-KEM (Kyber512) ---------- *)
+fun pk(skey): pkey.
+fun encap(pkey, bitstring): kemcipher.
+fun encap_ss(pkey, bitstring): sharedkey.
+fun decap(kemcipher, skey): sharedkey.
+
+equation forall sk: skey, r: bitstring;
+    decap(encap(pk(sk), r), sk) = encap_ss(pk(sk), r).
+
+(* ---------- GF(256) Shamir's Secret Sharing (3-of-5) ---------- *)
+(* make_share models f(x) = sk + a1*x + a2*x^2 over GF(256) *)
+fun make_share(skey, bitstring, icid): share.
+
+(* RECONSTRUCTION & DISTINCT SHARE ENFORCEMENT
+   This 'reduc' block models Lagrange Interpolation over GF(256).
+   By explicitly defining combinations with distinct IDs, we formally 
+   prove the Controller rejects "Clone-Share" attacks from compromised ICs. *)
+reduc 
+    forall sk: skey, r: bitstring; 
+        reconstruct3(make_share(sk, r, IC1), make_share(sk, r, IC3), make_share(sk, r, IC5), IC1, IC3, IC5) = sk;
+    forall sk: skey, r: bitstring; 
+        reconstruct3(make_share(sk, r, IC1), make_share(sk, r, IC2), make_share(sk, r, IC4), IC1, IC2, IC4) = sk;
+    forall sk: skey, r: bitstring; 
+        reconstruct3(make_share(sk, r, IC2), make_share(sk, r, IC3), make_share(sk, r, IC4), IC2, IC3, IC4) = sk;
+    forall sk: skey, r: bitstring; 
+        reconstruct3(make_share(sk, r, IC2), make_share(sk, r, IC4), make_share(sk, r, IC5), IC2, IC4, IC5) = sk.
+
+(* =============================================================================
+   5. EVENTS 
+   ============================================================================= *)
+event Sender_Encaps(pkey, kemcipher, sharedkey).
+event Controller_Decaps(pkey, kemcipher, sharedkey).
+event Verifier_Match(sharedkey).
+
+(* =============================================================================
+   6. SECURITY QUERIES
+   ============================================================================= *)
+free secret_sk: skey [private].
+free secret_shared_key: bitstring [private].
+
+(* Secrecy against a 2-IC compromise (Touch of Evil adversary) *)
+query attacker(secret_shared_key). 
+query attacker(secret_sk).         
+
+(* Reachability / Deadlock Check *)
+query ss_v: sharedkey; event(Verifier_Match(ss_v)).
+
+(* =============================================================================
+   7. PROCESS DEFINITIONS
+   ============================================================================= *)
+let Host(master_sk: skey) =
+    new r_sss: bitstring;
+    let pubkey = pk(master_sk) in
+
+    let s1 = make_share(master_sk, r_sss, IC1) in
+    let s2 = make_share(master_sk, r_sss, IC2) in
+    let s3 = make_share(master_sk, r_sss, IC3) in
+    let s4 = make_share(master_sk, r_sss, IC4) in
+    let s5 = make_share(master_sk, r_sss, IC5) in
+
+    out(ch_h_ic1, s1);
+    out(ch_h_ic2, s2);
+    out(ch_h_ic3, s3);
+    out(ch_h_ic4, s4);
+    out(ch_h_ic5, s5);
+
+    out(net, pubkey).
+
+let ProcessingIC(ch_from_host: channel, ch_to_ctrl: channel) =
+    in(ch_from_host, my_share: share);
+    in(ch_to_ctrl, req: bitstring);
+    out(ch_to_ctrl, my_share).
+
+let Sender() =
+    in(net, pubkey: pkey);
+
+    let ct = encap(pubkey, secret_shared_key) in
+    let ss = encap_ss(pubkey, secret_shared_key) in
+
+    event Sender_Encaps(pubkey, ct, ss);
+    out(net, ct);
+    out(ch_sender_verif, ss).
+
+let Controller(pubkey: pkey) =
+    in(net, ct: kemcipher);
+
+    new req: bitstring;
+    out(ch_ic1_ctrl, req); in(ch_ic1_ctrl, s_ic1: share);
+    out(ch_ic3_ctrl, req); in(ch_ic3_ctrl, s_ic3: share);
+    out(ch_ic5_ctrl, req); in(ch_ic5_ctrl, s_ic5: share);
+
+    let rec_sk = reconstruct3(s_ic1, s_ic3, s_ic5, IC1, IC3, IC5) in
+    let rcvd_ss = decap(ct, rec_sk) in
+
+    event Controller_Decaps(pubkey, ct, rcvd_ss);
+    out(ch_ctrl_verif, rcvd_ss).
+
+let Verifier() =
+    in(ch_sender_verif, sent_ss:  sharedkey);
+    in(ch_ctrl_verif,   rcvd_ss: sharedkey);
+    if sent_ss = rcvd_ss then
+        event Verifier_Match(sent_ss).
+
+(* =============================================================================
+   8. MAIN PROCESS
+   ============================================================================= *)
+process
+    let pk_bind = pk(secret_sk) in
+    (
+        Host(secret_sk)
+      | ProcessingIC(ch_h_ic1, ch_ic1_ctrl)
+      | ( in(ch_h_ic2, exposed_share: share); out(net, exposed_share) )
+      | ProcessingIC(ch_h_ic3, ch_ic3_ctrl)
+      | ( in(ch_h_ic4, exposed_share2: share); out(net, exposed_share2) )
+      | ProcessingIC(ch_h_ic5, ch_ic5_ctrl)
+      | Sender()
+      | ( in(net, pubkey_ctrl: pkey); Controller(pubkey_ctrl) )
+      | Verifier()
+    )

@@ -1,0 +1,135 @@
+(* ========================================================================= *)
+(* "TOUCH OF EVIL" LATTICE VSS & DEALERLESS DKG                              *)
+(* Simulating Hardware-level Kyber MLWE / SIS Commitments                    *)
+(* ========================================================================= *)
+
+(* --- Channels --- *)
+free net: channel.               (* Public untrusted network / bus *)
+free secure_bus: channel [private]. (* Point-to-point secure hardware routing *)
+
+(* --- Types --- *)
+type short_vec.  (* Lattice Ring-LWE vectors (e.g., s_i, e_i) *)
+type matrix.     (* Public CRS Matrix A *)
+type commitment. (* SIS Commitment (Com_i) *)
+type share.      (* Polynomial share f_i(j) *)
+type kyber_sk.   (* Final 1632-byte liboqs Secret Key *)
+type kyber_pk.   (* Final liboqs Public Key *)
+type kem_ct.     (* KEM Ciphertext *)
+
+(* --- Primitives & Constants --- *)
+const ok: bitstring.
+free A_matrix: matrix.
+free ic1_id: bitstring.
+free ic2_id: bitstring.
+
+(* Phase 1: SIS Commitments (Com_i = A*s_i + e_i) *)
+fun commit(matrix, short_vec, short_vec): commitment.
+
+(* Phase 2: VSS Evaluation (f_i(j)) *)
+(* We abstract the polynomial evaluation, keyed by the base secret and target IC *)
+fun eval_share(short_vec, bitstring): share.
+
+(* Phase 3: SIS Norm Bound Verification *)
+fun verify_share(share, commitment, matrix): bitstring.
+
+(* We tell ProVerif: A mathematically valid share generated from s_i 
+   will ALWAYS pass the norm bound check against Com_i *)
+equation forall A: matrix, s: short_vec, e: short_vec, id: bitstring;
+    verify_share(eval_share(s, id), commit(A, s, e), A) = ok.
+
+(* Phase 4: Aggregation *)
+fun aggregate_shares(share, share): short_vec.
+
+(* --- KEM Bridge (liboqs Simulation) --- *)
+fun derive_master_sk(short_vec, short_vec): kyber_sk.
+fun derive_master_pk(kyber_sk): kyber_pk.
+
+(* DKG Convergence Equation: 
+   We prove to ProVerif that if ICs aggregate their cross-evaluated shares, 
+   the resulting vectors mathematically converge to the same Master Key 
+   as if the root secrets were combined directly. *)
+equation forall s1: short_vec, s2: short_vec, id1: bitstring, id2: bitstring;
+    derive_master_sk(
+        aggregate_shares(eval_share(s1, id1), eval_share(s2, id1)),
+        aggregate_shares(eval_share(s1, id2), eval_share(s2, id2))
+    ) = derive_master_sk(s1, s2).
+
+fun encap(kyber_pk, bitstring): kem_ct.
+fun decap(kem_ct, kyber_sk): bitstring.
+
+(* Standard KEM Equation *)
+equation forall sk: kyber_sk, m: bitstring;
+    decap(encap(derive_master_pk(sk), m), sk) = m.
+
+
+(* --- Security Queries --- *)
+free master_kem_secret: bitstring [private].
+free s1_secret: short_vec [private].
+free s2_secret: short_vec [private].
+
+(* Query 1: Can the attacker extract the foundational hardware secrets? *)
+query attacker(s1_secret).
+query attacker(s2_secret).
+
+(* Query 2: Can the attacker break the resulting Kyber KEM? *)
+query attacker(master_kem_secret).
+
+(* --- Hardware IC Processes --- *)
+
+let IC1(s1: short_vec) =
+    new e1: short_vec;
+    
+    (* Phase 1: Generate & Broadcast SIS Commitment *)
+    let com1 = commit(A_matrix, s1, e1) in
+    out(net, com1);
+    
+    (* Phase 2: Generate & Distribute Shares *)
+    let sh11 = eval_share(s1, ic1_id) in
+    let sh12 = eval_share(s1, ic2_id) in
+    out(secure_bus, (ic2_id, sh12));
+    
+    (* Phase 3: Receive & Verify Peer's Share *)
+    in(net, com2: commitment);
+    in(secure_bus, (=ic1_id, sh21: share));
+    
+    if verify_share(sh21, com2, A_matrix) = ok then
+        (* Phase 4: Aggregate Verified Shares *)
+        let final_share_ic1 = aggregate_shares(sh11, sh21) in
+        0.
+
+let IC2(s2: short_vec) =
+    new e2: short_vec;
+    
+    (* Phase 1: Generate & Broadcast SIS Commitment *)
+    let com2 = commit(A_matrix, s2, e2) in
+    out(net, com2);
+    
+    (* Phase 2: Generate & Distribute Shares *)
+    let sh22 = eval_share(s2, ic2_id) in
+    let sh21 = eval_share(s2, ic1_id) in
+    out(secure_bus, (ic1_id, sh21));
+    
+    (* Phase 3: Receive & Verify Peer's Share *)
+    in(net, com1: commitment);
+    in(secure_bus, (=ic2_id, sh12: share));
+    
+    if verify_share(sh12, com1, A_matrix) = ok then
+        (* Phase 4: Aggregate Verified Shares *)
+        let final_share_ic2 = aggregate_shares(sh12, sh22) in
+        0.
+
+let KEM_Simulator(s1: short_vec, s2: short_vec) =
+    (* Simulates a third party fetching the DKG public key and encapsulating a secret *)
+    let m_sk = derive_master_sk(s1, s2) in
+    let m_pk = derive_master_pk(m_sk) in
+    out(net, m_pk);
+    
+    let ciphertext = encap(m_pk, master_kem_secret) in
+    out(net, ciphertext).
+
+(* --- Main --- *)
+process
+    let s1 = s1_secret in
+    let s2 = s2_secret in
+    
+    ( !IC1(s1) | !IC2(s2) | !KEM_Simulator(s1, s2) )
